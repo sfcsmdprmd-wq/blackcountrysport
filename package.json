@@ -1,0 +1,8 @@
+{
+  "name": "signalflow-encoder",
+  "version": "1.4.0",
+  "private": true,
+  "type": "module",
+  "scripts": { "start": "node encoder.mjs" },
+  "engines": { "node": ">=22" }
+}
