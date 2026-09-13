@@ -8,13 +8,27 @@ if(!Number.isInteger(sampleRate)||![1,2].includes(channels)||!["mp3","aac"].incl
 
 const siteHeaders=env.SIGNALFLOW_SITE_TOKEN?{"OAI-Sites-Authorization":`Bearer ${env.SIGNALFLOW_SITE_TOKEN}`}:{},ffmpegHeader=env.SIGNALFLOW_SITE_TOKEN?`OAI-Sites-Authorization: Bearer ${env.SIGNALFLOW_SITE_TOKEN}\r\n`:"";
 let encoder=null,decoder=null,fetcher=null,activeSignature="",stopping=false;
-const bytesPerSample=2,frameMs=Math.max(10,Number(env.PCM_FRAME_MS||20)),blockAlign=channels*bytesPerSample,frameBytes=Math.max(blockAlign,Math.round(sampleRate*blockAlign*frameMs/1000/blockAlign)*blockAlign),maxBufferBytes=Math.round(sampleRate*blockAlign*2);
+const bytesPerSample=2,blockAlign=channels*bytesPerSample;
+const requestedFrameMs=Number(env.PCM_FRAME_MS||20),frameMs=Number.isFinite(requestedFrameMs)&&requestedFrameMs>=10&&requestedFrameMs<=100?requestedFrameMs:20;
+const frameBytes=Math.max(blockAlign,Math.round(sampleRate*blockAlign*frameMs/1000/blockAlign)*blockAlign),maxBufferBytes=Math.round(sampleRate*blockAlign*2);
 let pcmQueue=[],pcmBytes=0,encoderBlocked=false,underrunFrames=0,backpressureEvents=0,droppedBytes=0;
 const log=(...args)=>console.log(new Date().toISOString(),...args);
 const icecastUrl=()=>{const auth=`${encodeURIComponent(env.ICECAST_SOURCE_USER)}:${encodeURIComponent(env.ICECAST_SOURCE_PASSWORD)}`,mount=env.ICECAST_MOUNT.startsWith("/")?env.ICECAST_MOUNT:`/${env.ICECAST_MOUNT}`;return`icecast://${auth}@${env.ICECAST_HOST}:${env.ICECAST_PORT}${mount}`};
 
 function encoderArgs(){const codec=format==="aac"?["-c:a","aac","-f","adts","-content_type","audio/aac"]:["-c:a","libmp3lame","-f","mp3","-content_type","audio/mpeg"];return["-hide_banner","-loglevel","warning","-f","s16le","-ar",String(sampleRate),"-ac",String(channels),"-i","pipe:0",...codec,"-b:a",env.AUDIO_BITRATE||"128k","-ice_name",env.STATION_NAME||"SignalFlow Radio","-ice_description",env.STATION_DESCRIPTION||"SignalFlow continuous playout","-ice_url",env.STATION_URL||"","-ice_public",env.ICECAST_PUBLIC==="true"?"1":"0",...(env.ICECAST_TLS==="true"?["-tls","1"]:[]),icecastUrl()]}
-function startEncoder(){if(encoder||stopping)return;log("Connecting continuous output to Icecast");encoder=spawn("ffmpeg",encoderArgs(),{stdio:["pipe","ignore","pipe"]});encoder.stderr.on("data",data=>process.stderr.write(data));encoder.stdin.on("error",()=>{});encoder.stdin.on("drain",()=>{encoderBlocked=false});encoder.on("exit",code=>{log(`Icecast encoder stopped (${code}); reconnecting`);encoder=null;if(!stopping)setTimeout(startEncoder,2000)})}
+function startEncoder(){
+  if(encoder||stopping)return;
+  log("Connecting continuous output to Icecast");
+  try{
+    const child=spawn("ffmpeg",encoderArgs(),{stdio:["pipe","ignore","pipe"]});
+    encoder=child;
+    child.stderr.on("data",data=>process.stderr.write(data));
+    child.stdin.on("error",error=>log(`Icecast stdin error: ${error.message}`));
+    child.stdin.on("drain",()=>{encoderBlocked=false});
+    child.on("error",error=>{log(`Unable to start Icecast encoder: ${error.message}`);if(encoder===child)encoder=null;if(!stopping)setTimeout(startEncoder,2000)});
+    child.on("exit",(code,signal)=>{log(`Icecast encoder stopped (code=${code ?? "none"}, signal=${signal ?? "none"}); reconnecting`);if(encoder===child)encoder=null;encoderBlocked=false;if(!stopping)setTimeout(startEncoder,2000)});
+  }catch(error){log(`Icecast encoder startup failed: ${error.message}`);encoder=null;if(!stopping)setTimeout(startEncoder,2000)}
+}
 
 function clearPcm(){pcmQueue=[];pcmBytes=0}
 function stopDecoder(){if(fetcher){fetcher.kill("SIGTERM");fetcher=null}if(decoder){decoder.kill("SIGTERM");decoder=null}activeSignature="";clearPcm()}
@@ -30,9 +44,20 @@ function startDecoder(status){
   else {const chain=[`aresample=${sampleRate}:async=1000:min_hard_comp=0.100:first_pts=0`];if(status.current.kind==="stream"&&status.current.timingType==="flexible"&&currentRemaining>3)chain.push(`afade=t=out:st=${Math.max(0,currentRemaining-3).toFixed(3)}:d=3`);args.push("-af",chain.join(","))}
   args.push("-t",currentRemaining.toFixed(3),"-vn","-f","s16le","-acodec","pcm_s16le","-ar",String(sampleRate),"-ac",String(channels),"pipe:1");
   activeSignature=signature(status);log(inputs.length>1?`Mixing ${(status.overlays||[]).map(item=>item.title).join(", ")} under ${status.current.title}`:`Starting ${status.current.title} (${status.current.id})`);const thisSignature=activeSignature;
-  decoder=spawn("ffmpeg",args,{stdio:[override?"pipe":"ignore","pipe","pipe"]});const thisDecoder=decoder;
-  if(override){const port=override.port||(override.protocol==="https:"?"443":"80");log(`Using DNS override ${overrideHost} -> ${overrideIp}`);fetcher=spawn("curl",["--fail","--silent","--show-error","--location","--no-buffer","--resolve",`${overrideHost}:${port}:${overrideIp}`,override.toString()],{stdio:["ignore","pipe","pipe"]});fetcher.stdout.pipe(decoder.stdin);fetcher.stderr.on("data",data=>process.stderr.write(data));fetcher.on("exit",()=>{fetcher=null;thisDecoder.stdin.end()});decoder.stdin.on("error",()=>{})}
-  decoder.stdout.on("data",enqueuePcm);decoder.stderr.on("data",data=>process.stderr.write(data));decoder.on("exit",code=>{if(decoder===thisDecoder){log(`Source pipeline ended (${code})`);decoder=null;if(activeSignature===thisSignature)activeSignature=""}});
+  let thisDecoder;
+  try{
+    thisDecoder=spawn("ffmpeg",args,{stdio:[override?"pipe":"ignore","pipe","pipe"]});decoder=thisDecoder;
+  }catch(error){log(`Source pipeline startup failed: ${error.message}`);decoder=null;activeSignature="";return}
+  thisDecoder.on("error",error=>{log(`Source pipeline error: ${error.message}`);if(decoder===thisDecoder){decoder=null;if(activeSignature===thisSignature)activeSignature=""}});
+  if(override){
+    const port=override.port||(override.protocol==="https:"?"443":"80");log(`Using DNS override ${overrideHost} -> ${overrideIp}`);
+    try{
+      const child=spawn("curl",["--fail","--silent","--show-error","--location","--no-buffer","--resolve",`${overrideHost}:${port}:${overrideIp}`,override.toString()],{stdio:["ignore","pipe","pipe"]});fetcher=child;
+      child.on("error",error=>log(`Stream fetcher error: ${error.message}`));
+      child.stdout.pipe(thisDecoder.stdin);child.stderr.on("data",data=>process.stderr.write(data));child.on("exit",()=>{if(fetcher===child)fetcher=null;if(!thisDecoder.stdin.destroyed)thisDecoder.stdin.end()});thisDecoder.stdin.on("error",error=>log(`Source stdin error: ${error.message}`));
+    }catch(error){log(`Stream fetcher startup failed: ${error.message}`);thisDecoder.kill("SIGTERM")}
+  }
+  thisDecoder.stdout.on("data",enqueuePcm);thisDecoder.stderr.on("data",data=>process.stderr.write(data));thisDecoder.on("exit",(code,signal)=>{if(decoder===thisDecoder){log(`Source pipeline ended (code=${code ?? "none"}, signal=${signal ?? "none"})`);decoder=null;if(activeSignature===thisSignature)activeSignature=""}});
 }
 
 async function readStatus(){const response=await fetch(`${site}/api/now`,{headers:siteHeaders,signal:AbortSignal.timeout(8000)});if(!response.ok)throw new Error(`SignalFlow returned HTTP ${response.status}`);return response.json()}
@@ -42,4 +67,6 @@ const silenceFrame=Buffer.alloc(frameBytes);
 const pump=setInterval(()=>{if(stopping||!encoder?.stdin.writable||encoderBlocked)return;let frame=dequeuePcm(frameBytes);if(!frame){frame=silenceFrame;underrunFrames++}if(!encoder.stdin.write(frame)){encoderBlocked=true;backpressureEvents++}},frameMs);
 setInterval(()=>{if(stopping)return;const bufferMs=Math.round(pcmBytes/(sampleRate*blockAlign)*1000),droppedMs=Math.round(droppedBytes/(sampleRate*blockAlign)*1000);log(`Audio health: buffer=${bufferMs}ms underruns=${underrunFrames} backpressure=${backpressureEvents} dropped=${droppedMs}ms`);underrunFrames=0;backpressureEvents=0;droppedBytes=0},30000);
 function shutdown(){stopping=true;clearInterval(pump);stopDecoder();if(encoder){encoder.stdin.end();setTimeout(()=>encoder?.kill("SIGTERM"),1000)}setTimeout(()=>process.exit(0),2000)}
-process.on("SIGTERM",shutdown);process.on("SIGINT",shutdown);startEncoder();scheduleLoop();
+process.on("uncaughtException",error=>log(`Uncaught exception: ${error?.stack||error}`));
+process.on("unhandledRejection",error=>log(`Unhandled rejection: ${error?.stack||error}`));
+process.on("SIGTERM",shutdown);process.on("SIGINT",shutdown);startEncoder();scheduleLoop().catch(error=>{log(`Schedule loop stopped unexpectedly: ${error?.stack||error}`);if(!stopping)setTimeout(()=>scheduleLoop().catch(err=>log(`Schedule loop restart failed: ${err?.stack||err}`)),1000)});
