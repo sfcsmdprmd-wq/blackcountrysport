@@ -1,0 +1,12 @@
+services:
+  encoder:
+    build: .
+    container_name: signalflow-encoder
+    restart: unless-stopped
+    env_file: .env
+    init: true
+    logging:
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: "3"
