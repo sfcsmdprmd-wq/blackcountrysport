@@ -1,0 +1,19 @@
+name: Validate SignalFlow encoder
+on:
+  pull_request:
+    paths:
+      - 'encoder.mjs'
+      - '.github/workflows/validate-encoder.yml'
+  push:
+    branches:
+      - 'fix/clean-handover-and-source-recovery'
+jobs:
+  syntax:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Check encoder JavaScript syntax
+        run: node --check encoder.mjs
