@@ -4,6 +4,7 @@ import { writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
+import { Readable } from "node:stream";
 import { promisify } from "node:util";
 import { pathToFileURL } from "node:url";
 
@@ -105,7 +106,7 @@ export function createPlayback({
   let plan = { current: null, next: null, scheduledNext: null };
   let lastServerTime = -Infinity;
   let expires = 0, healthy = false, halted = false, timer, job, closing;
-  let retryKey, retryAt = 0, failures = 0;
+  let completedKey, retryKey, retryAt = 0, failures = 0;
 
   function desired(time) {
     if (halted || time >= expires) return null;
@@ -162,7 +163,7 @@ export function createPlayback({
       : [];
     cache.retain([target, ...future]);
     if (job && job.slot.key !== target?.key) retire();
-    if (target && !job && !closing && (target.key !== retryKey || time >= retryAt)) {
+    if (target && target.key !== completedKey && !job && !closing && (target.key !== retryKey || time >= retryAt)) {
       const attempt = { slot: target, source: null, lastAudioAt: time };
       job = attempt;
       void start(attempt);
@@ -201,7 +202,7 @@ export function createPlayback({
       return null;
     }
     const source = job?.source;
-    if (!source || frameTime < target.start) return null;
+    if (!source || job.completed || frameTime < target.start) return null;
     const limit = Math.floor((Math.min(target.end, expires) - frameTime) * sampleRate / 1000) * bytesPerSampleFrame;
     frameBytes = Math.min(frameBytes, limit);
     if (frameBytes <= 0) return null;
@@ -221,7 +222,15 @@ export function createPlayback({
       failures = 0;
       return fadeScheduledStream(chunk, target, frameTime, bytesPerSampleFrame, sampleRate);
     }
-    if (source.exited || time - job.lastAudioAt > source.timeoutMs) {
+    if (target.item.isSustainBlock && source.stdout.readableEnded && source.exitCode === 0) {
+      // The slot can outlast the decoded file because Playout rounds durations
+      // up. Keep the slot silent until its API boundary without seeking again.
+      completedKey = target.key;
+      job.completed = true;
+      return null;
+    }
+    if ((source.exited && (source.stdout.readableEnded || source.stdout.destroyed)) ||
+        time - job.lastAudioAt > source.timeoutMs) {
       failed(job, new Error(`Source ended or stalled: ${job.slot.item.title}`));
     }
     return null;
@@ -236,7 +245,7 @@ export function createPlayback({
   }
   function resync(requireFresh = false) {
     if (requireFresh) healthy = false;
-    retire();
+    if (!job?.completed) retire();
     reconcile();
   }
   return { accept, unavailable, read, shutdown, resync };
@@ -348,7 +357,7 @@ function runEncoder(env = process.env) {
     const { item } = slot;
     const args = ["-hide_banner", "-loglevel", "warning", "-thread_queue_size", "2048"];
     let input = cached;
-    let override, prefixOffset = 0;
+    let override, prefixOffset = 0, trimSamples = 0;
     if (item.kind === "upload") {
       args.push("-analyzeduration", "20000000", "-probesize", "20000000");
       if (item.loop) args.push("-stream_loop", "-1");
@@ -358,8 +367,13 @@ function runEncoder(env = process.env) {
       prefixOffset = seekSamples * bytesPerSampleFrame;
       const tail = prefix && prefixOffset < prefix.length && (!item.loop || item.durationSeconds > prefixSeconds)
         ? prefix.length / bytesPerSampleFrame / sampleRate : seek;
-      if (tail === seek) prefix = null;
-      if (tail > 0) args.push("-ss", tail.toFixed(6));
+      if (tail === seek && !(item.isSustainBlock && prefix &&
+          prefix.length < prefixSeconds * sampleRate * bytesPerSampleFrame)) prefix = null;
+      if (item.isSustainBlock) {
+        // Decode from the beginning and count resampled PCM. Container seek
+        // timestamps can disagree with the samples used for the cached prefix.
+        trimSamples = prefix ? prefix.length / bytesPerSampleFrame : seekSamples;
+      } else if (tail > 0) args.push("-ss", tail.toFixed(6));
     } else {
       const remote = item.sourceUrl && new URL(item.sourceUrl);
       const host = env.STREAM_HOST_OVERRIDE_HOST?.trim();
@@ -373,18 +387,31 @@ function runEncoder(env = process.env) {
         if (url.origin === siteOrigin && ffmpegHeader) args.push("-headers", ffmpegHeader);
       }
     }
+    if (item.isSustainBlock && prefix && prefix.length < prefixSeconds * sampleRate * bytesPerSampleFrame) {
+      // A successful prefix decode shorter than its limit already contains
+      // the whole file. There is no FFmpeg tail to open or seek into.
+      log(`Starting ${item.title} (${item.id})`);
+      return {
+        stdout: Readable.from([], { objectMode: false }), exited: true, exitCode: 0,
+        timeoutMs: 12000, prefix, prefixOffset,
+      };
+    }
     args.push("-i", input);
     const layout = channels === 1 ? "mono" : "stereo";
     const filters = [`aresample=${sampleRate}:async=1:first_pts=0`, `aformat=sample_fmts=s16:sample_rates=${sampleRate}:channel_layouts=${layout}`];
+    if (trimSamples) filters.push(`atrim=start_sample=${trimSamples}`, "asetpts=PTS-STARTPTS");
     args.push("-vn", "-af", filters.join(","), "-f", "s16le", "-acodec", "pcm_s16le",
       "-ar", String(sampleRate), "-ac", String(channels), "pipe:1");
     const child = spawn("ffmpeg", args, { stdio: [override ? "pipe" : "ignore", "pipe", "pipe"] });
     const exited = processExit(child);
     const source = { child, stdout: child.stdout, childExit: exited, exited: false, timeoutMs: 12000, prefix, prefixOffset };
+    // Node resumes child stdio at process exit. A readable listener keeps PCM
+    // in pull mode so the last buffered chunks survive until the clock reads them.
+    child.stdout.on("readable", () => {});
     child.stderr.on("data", data => process.stderr.write(data));
     child.once("error", onError);
     child.stdout.on("error", onError);
-    void exited.then(() => { source.exited = true; });
+    void exited.then(code => { source.exitCode = code; source.exited = true; });
     if (override) {
       const port = override.port || (override.protocol === "https:" ? "443" : "80");
       log(`Using configured DNS override for ${override.hostname}`);
