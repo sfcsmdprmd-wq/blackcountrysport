@@ -4,53 +4,390 @@ import { writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-const env=process.env,required=["SIGNALFLOW_URL","ICECAST_HOST","ICECAST_PORT","ICECAST_MOUNT","ICECAST_SOURCE_USER","ICECAST_SOURCE_PASSWORD"];
-for(const key of required)if(!env[key])throw new Error(`Missing required setting: ${key}`);
+import { pathToFileURL } from "node:url";
 
-const site=env.SIGNALFLOW_URL.replace(/\/$/,""),sampleRate=Number(env.AUDIO_SAMPLE_RATE||44100),channels=Number(env.AUDIO_CHANNELS||2),format=(env.AUDIO_FORMAT||"mp3").toLowerCase();
-if(!Number.isInteger(sampleRate)||![1,2].includes(channels)||!["mp3","aac"].includes(format))throw new Error("Invalid audio format settings");
+const pollMs = 250;
+const planLeaseMs = 2500;
+const frameMs = 10;
+const retryMaxMs = 30000;
 
-const siteHeaders=env.SIGNALFLOW_SITE_TOKEN?{"OAI-Sites-Authorization":`Bearer ${env.SIGNALFLOW_SITE_TOKEN}`}:{},ffmpegHeader=env.SIGNALFLOW_SITE_TOKEN?`OAI-Sites-Authorization: Bearer ${env.SIGNALFLOW_SITE_TOKEN}\r\n`:"";
-let encoder=null,decoder=null,fetcher=null,activeSignature="",pendingSignature="",lastPcm=0,sourceStartedAt=0,sourceLastAudioAt=0,stopping=false;
-const mediaCache=new Map();
-const startedItems=new Set();
-const sourceRetries=new Map();
-const RETRY_BASE_MS=2000,RETRY_MAX_MS=30000;
-function recordSourceFailure(id){const previous=sourceRetries.get(id)||{attempts:0};const attempts=previous.attempts+1;const delay=Math.min(RETRY_MAX_MS,RETRY_BASE_MS*2**Math.min(attempts-1,4));sourceRetries.set(id,{attempts,nextAt:Date.now()+delay});log(`Source ${id} retry ${attempts} delayed ${delay}ms`)}
-const log=(...args)=>console.log(new Date().toISOString(),...args);
-const icecastUrl=()=>{const auth=`${encodeURIComponent(env.ICECAST_SOURCE_USER)}:${encodeURIComponent(env.ICECAST_SOURCE_PASSWORD)}`,mount=env.ICECAST_MOUNT.startsWith("/")?env.ICECAST_MOUNT:`/${env.ICECAST_MOUNT}`;return`icecast://${auth}@${env.ICECAST_HOST}:${env.ICECAST_PORT}${mount}`};
-
-function encoderArgs(){const codec=format==="aac"?["-c:a","aac","-f","adts","-content_type","audio/aac"]:["-c:a","libmp3lame","-f","mp3","-content_type","audio/mpeg"];return["-hide_banner","-loglevel","warning","-re","-f","s16le","-ar",String(sampleRate),"-ac",String(channels),"-i","pipe:0",...codec,"-b:a",env.AUDIO_BITRATE||"128k","-ice_name",env.STATION_NAME||"SignalFlow Radio","-ice_description",env.STATION_DESCRIPTION||"SignalFlow continuous playout","-ice_url",env.STATION_URL||"","-ice_public",env.ICECAST_PUBLIC==="true"?"1":"0",...(env.ICECAST_TLS==="true"?["-tls","1"]:[]),icecastUrl()]}
-function startEncoder(){if(encoder||stopping)return;log("Connecting continuous output to Icecast");encoder=spawn("ffmpeg",encoderArgs(),{stdio:["pipe","ignore","pipe"]});encoder.stderr.on("data",data=>process.stderr.write(data));encoder.stdin.on("error",()=>{});encoder.on("exit",code=>{log(`Icecast encoder stopped (${code}); reconnecting`);encoder=null;if(!stopping)setTimeout(startEncoder,2000)})}
-
-function stopProcess(process){if(process&&!process.killed)process.kill("SIGTERM")}
-function stopDecoder(){stopProcess(fetcher);stopProcess(decoder);fetcher=null;decoder=null;activeSignature="";pendingSignature="";sourceStartedAt=0;sourceLastAudioAt=0}
-function signature(status){return status.current?.id||""}
-function playbackUrl(item){return item.playbackUrl||(item.kind==="stream"?`/api/stream/${item.assetId}`:`/api/media/${item.assetId}`)}
-function preRoll(status){const next=status.next,start=next?new Date(next.startAt).getTime():0,lead=start-Date.now();if(!status.current||!status.playbackUrl||!next||lead<=0||lead>3000)return status;const fastEnd=status.current.kind==="upload"||next.forcedTake,fadeEnd=fastEnd?start:start+3000,fadeStart=fastEnd?Math.max(new Date(status.current.startAt).getTime(),start-1000):start,outgoing={...status.current,endAt:new Date(fadeEnd).toISOString(),fadeStartAt:new Date(fadeStart).toISOString(),playbackUrl:status.playbackUrl};return{...status,current:next,playbackUrl:playbackUrl(next),overlays:[...(status.overlays||[]).filter(item=>item.id!==outgoing.id&&new Date(item.endAt).getTime()>Date.now()),outgoing]}}
-async function cacheUpload(item,playbackUrl){const resolvedUrl=new URL(playbackUrl,site).toString(),key=resolvedUrl;if(mediaCache.has(key))return mediaCache.get(key);const task=(async()=>{const response=await fetch(resolvedUrl,{headers:siteHeaders,signal:AbortSignal.timeout(30000)});if(!response.ok)throw new Error(`Audio download returned HTTP ${response.status}`);const bytes=Buffer.from(await response.arrayBuffer());if(!bytes.length)throw new Error("Downloaded audio file was empty");const hash=createHash("sha256").update(key).digest("hex");const path=join(tmpdir(),`signalflow-${hash}.audio`);await writeFile(path,bytes);log(`Cached ${item.title} (${Math.round(bytes.length/1024)} KB)`);return path})().catch(error=>{mediaCache.delete(key);throw error});mediaCache.set(key,task);return task}
-async function startDecoder(status,wanted){
-  if(!status.current||!status.playbackUrl)return;pendingSignature=wanted;
-  let inputs=[...(status.overlays||[]).map(item=>({item,playbackUrl:item.playbackUrl,outgoing:true})),{item:status.current,playbackUrl:status.playbackUrl,outgoing:false}];
-  try{inputs=await Promise.all(inputs.map(async input=>input.item.kind==="upload"?{...input,playbackUrl:await cacheUpload(input.item,input.playbackUrl)}:input));if(stopping||pendingSignature!==wanted)return;
-  const now=Date.now(),args=["-hide_banner","-loglevel","warning"],overrideHost=env.STREAM_HOST_OVERRIDE_HOST?.trim(),overrideIp=env.STREAM_HOST_OVERRIDE_IP?.trim();let override=null;
-  for(const input of inputs){let url=input.item.kind==="upload"?input.playbackUrl:input.playbackUrl.startsWith("/")?new URL(input.playbackUrl,site).toString():input.playbackUrl,remote=input.item.kind==="stream"&&input.item.sourceUrl?new URL(input.item.sourceUrl):null,useOverride=env.STREAM_HOST_OVERRIDE_ENABLED==="true"&&!!remote&&!!overrideHost&&!!overrideIp&&remote.hostname===overrideHost&&!override;if(useOverride){url="pipe:0";override=remote}args.push("-thread_queue_size","2048");if(input.item.kind==="upload")args.push("-analyzeduration","20000000","-probesize","20000000");if(url.startsWith(site)&&ffmpegHeader)args.push("-headers",ffmpegHeader);const rawElapsed=Math.max(0,(now-new Date(input.item.startAt).getTime())/1000),protectOpening=input.item.kind==="upload"&&!input.outgoing&&!startedItems.has(input.item.id)&&rawElapsed<=5,elapsedBase=protectOpening?0:rawElapsed,elapsed=input.item.loop&&input.item.durationSeconds?elapsedBase%input.item.durationSeconds:elapsedBase;input.elapsed=elapsed;if(input.item.loop)args.push("-stream_loop","-1");args.push("-i",url)}
-  const currentRemaining=Math.max(.1,(new Date(status.current.endAt).getTime()-now)/1000),pipelineRemaining=Math.max(currentRemaining,...inputs.filter(input=>input.outgoing).map(input=>Math.max(.1,(new Date(input.item.endAt).getTime()-now)/1000)));
-  const filters=[],labels=[],layout=channels===1?"mono":"stereo";
-  inputs.forEach((input,index)=>{const chain=[],startsIn=Math.max(0,(new Date(input.item.startAt).getTime()-now)/1000);if(input.item.kind==="upload"&&input.elapsed>.01)chain.push(`atrim=start=${input.elapsed.toFixed(3)}`,"asetpts=PTS-STARTPTS");if(!input.outgoing&&startsIn>.01&&input.item.kind==="stream")chain.push(`atrim=start=${startsIn.toFixed(3)}`,"asetpts=PTS-STARTPTS");chain.push(`aresample=${sampleRate}:async=1:first_pts=0`,`aformat=sample_fmts=s16:sample_rates=${sampleRate}:channel_layouts=${layout}`);if(!input.outgoing&&startsIn>.01&&input.item.kind==="upload")chain.push(`adelay=${Math.round(startsIn*1000)}:all=1`);if(input.outgoing){const fadeStart=Math.max(0,(new Date(input.item.fadeStartAt||input.item.handoverAt||now).getTime()-now)/1000),fadeEnd=Math.max(fadeStart+.1,(new Date(input.item.endAt).getTime()-now)/1000);chain.push(`afade=t=out:st=${fadeStart.toFixed(3)}:d=${(fadeEnd-fadeStart).toFixed(3)}`)}else if(input.item.kind==="stream")chain.push(`afade=t=out:st=${Math.max(0,currentRemaining-3).toFixed(3)}:d=${Math.min(3,currentRemaining).toFixed(3)}`);const label=`in${index}`;filters.push(`[${index}:a]${chain.join(",")}[${label}]`);labels.push(`[${label}]`)});
-  if(inputs.length>1){filters.push(`${labels.join("")}amix=inputs=${inputs.length}:duration=longest:dropout_transition=0:normalize=0,alimiter=limit=0.95[mix]`);args.push("-filter_complex",filters.join(";"),"-map","[mix]")}
-  else args.push("-filter_complex",filters.join(";"),"-map",labels[0]);
-  args.push("-t",pipelineRemaining.toFixed(3),"-vn","-f","s16le","-acodec","pcm_s16le","-ar",String(sampleRate),"-ac",String(channels),"pipe:1");
-  const description=inputs.length>1?`Mixing ${(status.overlays||[]).map(item=>item.title).join(", ")} under ${status.current.title}`:`Starting ${status.current.title} (${status.current.id})`,candidate=spawn("ffmpeg",args,{stdio:[override?"pipe":"ignore","pipe","pipe"]});let candidateFetcher=null,promoted=false;
-  if(override){const port=override.port||(override.protocol==="https:"?"443":"80");log(`Using DNS override ${overrideHost} -> ${overrideIp}`);candidateFetcher=spawn("curl",["--fail","--silent","--show-error","--location","--no-buffer","--connect-timeout","8","--resolve",`${overrideHost}:${port}:${overrideIp}`,override.toString()],{stdio:["ignore","pipe","pipe"]});candidateFetcher.stdout.pipe(candidate.stdin);candidateFetcher.stderr.on("data",data=>process.stderr.write(data));candidateFetcher.on("exit",()=>candidate.stdin.end());candidate.stdin.on("error",()=>{})}
-  const startupTimeout=setTimeout(()=>{if(!promoted&&pendingSignature===wanted){log(`Source startup timed out: ${status.current.title}; retrying`);stopProcess(candidateFetcher);stopProcess(candidate);pendingSignature="";recordSourceFailure(wanted)}},12000);
-  candidate.stdout.on("data",chunk=>{if(stopping||pendingSignature!==wanted&&!promoted){stopProcess(candidateFetcher);stopProcess(candidate);return}if(!promoted){const oldDecoder=decoder,oldFetcher=fetcher;decoder=candidate;fetcher=candidateFetcher;activeSignature=wanted;pendingSignature="";clearTimeout(startupTimeout);promoted=true;startedItems.add(status.current.id);sourceRetries.delete(wanted);sourceStartedAt=Date.now();sourceLastAudioAt=sourceStartedAt;log(description);if(oldDecoder&&oldDecoder!==candidate)log("Warm handover completed");stopProcess(oldFetcher);stopProcess(oldDecoder)}if(decoder!==candidate)return;lastPcm=Date.now();sourceLastAudioAt=lastPcm;if(encoder?.stdin.writable&&!encoder.stdin.write(chunk)){candidate.stdout.pause();encoder.stdin.once("drain",()=>{if(decoder===candidate)candidate.stdout.resume()})}});candidate.stderr.on("data",data=>process.stderr.write(data));candidate.on("exit",code=>{clearTimeout(startupTimeout);if(!promoted){stopProcess(candidateFetcher);if(pendingSignature===wanted){pendingSignature="";recordSourceFailure(wanted);log(`Replacement source failed before handover (${code})`)}}else if(decoder===candidate){log(`Source pipeline ended (${code})`);decoder=null;fetcher=null;if(activeSignature===wanted)activeSignature=""}})}catch(error){if(pendingSignature===wanted){pendingSignature="";recordSourceFailure(wanted);log(`Couldn’t prepare source: ${error.message}`)}}
+function timedItem(item, url) {
+  if (!item || !url) return null;
+  const start = Date.parse(item.startAt), end = Date.parse(item.endAt);
+  if (!Number.isFinite(start) || !Number.isFinite(end) || end <= start) return null;
+  return { item, url, start, end, key: JSON.stringify([item.id, start, url]) };
 }
 
-async function readStatus(){const response=await fetch(`${site}/api/now`,{headers:siteHeaders,signal:AbortSignal.timeout(8000)});if(!response.ok)throw new Error(`SignalFlow returned HTTP ${response.status}`);return response.json()}
-async function scheduleLoop(){while(!stopping){try{const live=await readStatus();if(live.next?.kind==="upload")void cacheUpload(live.next,playbackUrl(live.next)).catch(error=>log(`Couldn’t pre-cache ${live.next.title}: ${error.message}`));const status=live,wanted=signature(status);if(wanted!==activeSignature&&activeSignature){log(`Scheduled cutover: ${activeSignature} -> ${wanted||"silence"}; stopping outgoing source before replacement`);stopDecoder()}if(wanted&&wanted!==activeSignature&&wanted!==pendingSignature&&Date.now()>=(sourceRetries.get(wanted)?.nextAt||0))void startDecoder(status,wanted)}catch(error){log(error.message)}await new Promise(resolve=>setTimeout(resolve,250))}}
+function playbackUrl(item) {
+  return item.playbackUrl || (item.kind === "stream" ? `/api/stream/${item.assetId}` : `/api/media/${item.assetId}`);
+}
 
-setInterval(()=>{if(!stopping&&decoder&&sourceStartedAt&&Date.now()-sourceStartedAt>10000&&Date.now()-sourceLastAudioAt>7000){log(`Source audio stalled for ${Math.round((Date.now()-sourceLastAudioAt)/1000)}s; restarting decoder`);stopDecoder()}},1000);
-const silenceBytes=Math.floor(sampleRate*channels*2/10),silence=Buffer.alloc(silenceBytes);setInterval(()=>{if(!stopping&&Date.now()-lastPcm>2000&&encoder?.stdin.writable&&!encoder.stdin.writableNeedDrain)encoder.stdin.write(silence)},100);
-function shutdown(){stopping=true;stopDecoder();if(encoder){encoder.stdin.end();setTimeout(()=>encoder?.kill("SIGTERM"),1000)}setTimeout(()=>process.exit(0),2000)}
-process.on("SIGTERM",shutdown);process.on("SIGINT",shutdown);startEncoder();scheduleLoop();
+export function playbackPlan(status) {
+  const current = timedItem(status.current, status.playbackUrl || status.current?.playbackUrl);
+  const next = timedItem(status.next, status.next && playbackUrl(status.next));
+  const scheduledNext = timedItem(status.scheduledNext, status.scheduledNext && playbackUrl(status.scheduledNext));
+  if (current && next && next.start > current.start) current.end = Math.min(current.end, next.start);
+  return { current, next, scheduledNext };
+}
+
+export function dueSource(plan, now, allowNext = true) {
+  const { current, next } = plan;
+  if (allowNext && next && next.start <= now && now < next.end) return next;
+  if (current && current.start <= now && now < current.end) return current;
+  return null;
+}
+
+export function createMediaCache(site, headers, fetchMedia = fetch, saveFile = writeFile, root = tmpdir()) {
+  const entries = new Map();
+  const resolve = url => new URL(url, site).href;
+
+  function download(slot) {
+    const key = resolve(slot.url);
+    const cached = entries.get(key);
+    if (cached) return cached.task;
+    const controller = new AbortController();
+    const entry = { controller, complete: false };
+    const signal = AbortSignal.any([controller.signal, AbortSignal.timeout(30000)]);
+    entry.task = (async () => {
+      const response = await fetchMedia(key, { headers, signal });
+      if (!response.ok) throw new Error(`Audio download returned HTTP ${response.status}`);
+      const bytes = Buffer.from(await response.arrayBuffer());
+      if (!bytes.length) throw new Error("Downloaded audio file was empty");
+      signal.throwIfAborted();
+      const hash = createHash("sha256").update(key).digest("hex");
+      const path = join(root, `signalflow-${hash}.audio`);
+      await saveFile(path, bytes);
+      signal.throwIfAborted();
+      entry.complete = true;
+      return path;
+    })().catch(error => {
+      if (entries.get(key) === entry) entries.delete(key);
+      throw error;
+    });
+    entries.set(key, entry);
+    return entry.task;
+  }
+
+  function retain(slots) {
+    const wanted = new Set(slots.filter(slot => slot?.item.kind === "upload").map(slot => resolve(slot.url)));
+    for (const [key, entry] of entries) {
+      if (!entry.complete && !wanted.has(key)) {
+        entries.delete(key);
+        entry.controller.abort();
+      }
+    }
+  }
+
+  return { download, retain };
+}
+
+export function createPlayback({
+  now = Date.now, open, stop, cache, onError = () => {},
+  setTimer = setTimeout, clearTimer = clearTimeout,
+}) {
+  let plan = { current: null, next: null, scheduledNext: null };
+  let lastServerTime = -Infinity;
+  let expires = 0, healthy = false, halted = false, timer, job, closing;
+  let retryKey, retryAt = 0, failures = 0;
+
+  function desired(time) {
+    if (halted || time >= expires) return null;
+    if (!healthy) {
+      return job?.hasAudio && job.slot.key === plan.current?.key && plan.current.end > time
+        ? plan.current : null;
+    }
+    return dueSource(plan, time);
+  }
+
+  function retire() {
+    const previous = job;
+    job = null;
+    if (!previous?.source) return;
+    const stopped = Promise.resolve(stop(previous.source));
+    closing = stopped;
+    void stopped.then(() => {
+      if (closing === stopped) closing = null;
+      reconcile();
+    }, error => {
+      // Fail closed if the process exit cannot be verified.
+      onError(error);
+    });
+  }
+
+  function failed(attempt, error) {
+    if (job !== attempt) return;
+    const key = attempt.slot.key;
+    failures = retryKey === key ? failures + 1 : 1;
+    retryKey = key;
+    retryAt = now() + Math.min(retryMaxMs, 500 * 2 ** Math.min(failures - 1, 6));
+    if (error) onError(error);
+    retire();
+    reconcile();
+  }
+
+  async function start(attempt) {
+    try {
+      const { slot } = attempt;
+      const prepared = slot.item.kind === "upload" ? await cache.download(slot) : null;
+      const time = now(), target = desired(time);
+      if (job !== attempt || target?.key !== slot.key) return;
+      attempt.source = open(target, prepared, time, error => failed(attempt, error));
+      attempt.lastAudioAt = now();
+    } catch (error) { failed(attempt, error); }
+  }
+
+  function reconcile() {
+    clearTimer(timer);
+    if (halted) return;
+    const time = now(), target = desired(time);
+    const future = healthy && time < expires
+      ? [plan.next, plan.scheduledNext].filter(slot => slot && slot.start > time && slot.start - time < 30000)
+      : [];
+    cache.retain([target, ...future]);
+    if (job && job.slot.key !== target?.key) retire();
+    if (target && !job && !closing && (target.key !== retryKey || time >= retryAt)) {
+      const attempt = { slot: target, source: null, lastAudioAt: time };
+      job = attempt;
+      void start(attempt);
+    }
+    const boundaries = [
+      expires, plan.current?.start, plan.current?.end, plan.next?.start, plan.next?.end, retryAt,
+    ].filter(value => value > time);
+    if (boundaries.length) timer = setTimer(reconcile, Math.min(30000, Math.min(...boundaries) - time));
+  }
+
+  function accept(status) {
+    const serverTime = Date.parse(status.serverTime);
+    if (Number.isFinite(serverTime) && serverTime < lastServerTime) return;
+    if (Number.isFinite(serverTime)) lastServerTime = serverTime;
+    plan = playbackPlan(status);
+    healthy = true;
+    expires = now() + planLeaseMs;
+    reconcile();
+    for (const slot of [plan.next, plan.scheduledNext]) {
+      if (slot?.item.kind === "upload" && slot.start > now() && slot.start - now() < 30000) {
+        void cache.download(slot).catch(() => {});
+      }
+    }
+  }
+
+  function unavailable() {
+    healthy = false;
+    reconcile();
+  }
+
+  function read(frameBytes, bytesPerSampleFrame, sampleRate) {
+    const time = now();
+    const target = desired(time);
+    if (job && job.slot.key !== target?.key) {
+      reconcile();
+      return null;
+    }
+    const source = job?.source;
+    if (!source) return null;
+    const limit = Math.floor((Math.min(target.end, expires) - time) * sampleRate / 1000) * bytesPerSampleFrame;
+    frameBytes = Math.min(frameBytes, limit);
+    if (frameBytes <= 0) return null;
+    const available = source.stdout.readableLength;
+    const chunk = source.stdout.read(available >= frameBytes ? frameBytes : source.exited && available ? available : frameBytes);
+    if (chunk?.length) {
+      job.lastAudioAt = time;
+      job.hasAudio = true;
+      retryKey = undefined;
+      failures = 0;
+      return chunk;
+    }
+    if (source.exited || time - job.lastAudioAt > source.timeoutMs) {
+      failed(job, new Error(`Source ended or stalled: ${job.slot.item.title}`));
+    }
+    return null;
+  }
+
+  function shutdown() {
+    halted = true;
+    clearTimer(timer);
+    cache.retain([]);
+    retire();
+    return closing;
+  }
+  return { accept, unavailable, read, shutdown };
+}
+
+export function renderFrame(audio, bytes) {
+  if (audio?.length === bytes) return audio;
+  const frame = Buffer.alloc(bytes);
+  audio?.copy(frame);
+  return frame;
+}
+
+function processExit(child) {
+  return new Promise(resolve => {
+    child.once("exit", resolve);
+    child.on("error", () => { if (!child.pid) resolve(); });
+  });
+}
+
+async function stopChild(child, exited) {
+  if (!child) return;
+  child.kill("SIGTERM");
+  const escalate = setTimeout(() => child.kill("SIGKILL"), 500);
+  try { await exited; }
+  finally { clearTimeout(escalate); }
+}
+
+function runEncoder(env = process.env) {
+  const required = ["SIGNALFLOW_URL", "ICECAST_HOST", "ICECAST_PORT", "ICECAST_MOUNT", "ICECAST_SOURCE_USER", "ICECAST_SOURCE_PASSWORD"];
+  for (const key of required) if (!env[key]) throw new Error(`Missing required setting: ${key}`);
+  const site = env.SIGNALFLOW_URL.replace(/\/$/, "");
+  const siteOrigin = new URL(site).origin;
+  const sampleRate = Number(env.AUDIO_SAMPLE_RATE || 44100);
+  const channels = Number(env.AUDIO_CHANNELS || 2);
+  const format = (env.AUDIO_FORMAT || "mp3").toLowerCase();
+  if (!Number.isInteger(sampleRate) || sampleRate <= 0 || ![1, 2].includes(channels) || !["mp3", "aac"].includes(format)) {
+    throw new Error("Invalid audio format settings");
+  }
+  const siteHeaders = env.SIGNALFLOW_SITE_TOKEN
+    ? { "OAI-Sites-Authorization": `Bearer ${env.SIGNALFLOW_SITE_TOKEN}` } : {};
+  const ffmpegHeader = env.SIGNALFLOW_SITE_TOKEN
+    ? `OAI-Sites-Authorization: Bearer ${env.SIGNALFLOW_SITE_TOKEN}\r\n` : "";
+  const cache = createMediaCache(site, siteHeaders);
+  const log = (...args) => console.log(new Date().toISOString(), ...args);
+
+  function open(slot, cached, now, onError) {
+    const { item } = slot;
+    const args = ["-hide_banner", "-loglevel", "warning", "-thread_queue_size", "2048"];
+    let input = cached;
+    let override;
+    if (item.kind === "upload") {
+      args.push("-analyzeduration", "20000000", "-probesize", "20000000");
+      if (item.loop) args.push("-stream_loop", "-1");
+      const elapsed = (now - slot.start) / 1000;
+      const seek = item.loop && item.durationSeconds ? elapsed % item.durationSeconds : elapsed;
+      if (seek > 0) args.push("-ss", seek.toFixed(3));
+    } else {
+      const remote = item.sourceUrl && new URL(item.sourceUrl);
+      const host = env.STREAM_HOST_OVERRIDE_HOST?.trim();
+      const ip = env.STREAM_HOST_OVERRIDE_IP?.trim();
+      if (env.STREAM_HOST_OVERRIDE_ENABLED === "true" && remote && host && ip && remote.hostname === host) {
+        override = remote;
+        input = "pipe:0";
+      } else {
+        const url = new URL(slot.url, site);
+        input = url.href;
+        if (url.origin === siteOrigin && ffmpegHeader) args.push("-headers", ffmpegHeader);
+      }
+    }
+    args.push("-i", input);
+    const layout = channels === 1 ? "mono" : "stereo";
+    const filters = [`aresample=${sampleRate}:async=1:first_pts=0`, `aformat=sample_fmts=s16:sample_rates=${sampleRate}:channel_layouts=${layout}`];
+    const remaining = (slot.end - now) / 1000;
+    if (item.kind === "stream" && !item.isDefault) {
+      filters.push(`afade=t=out:st=${Math.max(0, remaining - 3).toFixed(3)}:d=${Math.min(3, remaining).toFixed(3)}`);
+    }
+    args.push("-vn", "-af", filters.join(","), "-f", "s16le", "-acodec", "pcm_s16le",
+      "-ar", String(sampleRate), "-ac", String(channels), "pipe:1");
+    const child = spawn("ffmpeg", args, { stdio: [override ? "pipe" : "ignore", "pipe", "pipe"] });
+    const exited = processExit(child);
+    const source = { child, stdout: child.stdout, childExit: exited, exited: false, timeoutMs: 12000 };
+    child.stderr.on("data", data => process.stderr.write(data));
+    child.once("error", onError);
+    child.stdout.on("error", onError);
+    void exited.then(() => { source.exited = true; });
+    if (override) {
+      const port = override.port || (override.protocol === "https:" ? "443" : "80");
+      log(`Using configured DNS override for ${override.hostname}`);
+      const fetcher = spawn("curl", ["--fail", "--silent", "--show-error", "--location", "--no-buffer",
+        "--connect-timeout", "8", "--resolve", `${override.hostname}:${port}:${env.STREAM_HOST_OVERRIDE_IP.trim()}`,
+        override.href], { stdio: ["ignore", "pipe", "pipe"] });
+      source.fetcher = fetcher;
+      source.fetcherExit = processExit(fetcher);
+      fetcher.stderr.on("data", data => process.stderr.write(data));
+      fetcher.once("error", onError);
+      child.stdin.on("error", () => {});
+      fetcher.stdout.pipe(child.stdin);
+    }
+    log(`Starting ${item.title} (${item.id})`);
+    return source;
+  }
+
+  async function stop(source) {
+    source.stdout.destroy();
+    await Promise.all([stopChild(source.fetcher, source.fetcherExit), stopChild(source.child, source.childExit)]);
+  }
+
+  const playback = createPlayback({ open, stop, cache, onError: error => log(error.message) });
+  const icecastUrl = () => {
+    const auth = `${encodeURIComponent(env.ICECAST_SOURCE_USER)}:${encodeURIComponent(env.ICECAST_SOURCE_PASSWORD)}`;
+    const mount = env.ICECAST_MOUNT.startsWith("/") ? env.ICECAST_MOUNT : `/${env.ICECAST_MOUNT}`;
+    return `icecast://${auth}@${env.ICECAST_HOST}:${env.ICECAST_PORT}${mount}`;
+  };
+
+  let encoder, stopping = false, frameIndex = 0;
+  function startEncoder() {
+    if (encoder || stopping) return;
+    const codec = format === "aac" ? ["-c:a", "aac", "-f", "adts", "-content_type", "audio/aac"]
+      : ["-c:a", "libmp3lame", "-f", "mp3", "-content_type", "audio/mpeg"];
+    const args = ["-hide_banner", "-loglevel", "warning", "-f", "s16le", "-ar", String(sampleRate),
+      "-ac", String(channels), "-i", "pipe:0", ...codec, "-b:a", env.AUDIO_BITRATE || "128k",
+      "-ice_name", env.STATION_NAME || "SignalFlow Radio",
+      "-ice_description", env.STATION_DESCRIPTION || "SignalFlow continuous playout",
+      "-ice_url", env.STATION_URL || "", "-ice_public", env.ICECAST_PUBLIC === "true" ? "1" : "0",
+      ...(env.ICECAST_TLS === "true" ? ["-tls", "1"] : []), icecastUrl()];
+    log("Connecting continuous output to Icecast");
+    const child = spawn("ffmpeg", args, { stdio: ["pipe", "ignore", "pipe"] });
+    encoder = child;
+    child.stderr.on("data", data => process.stderr.write(data));
+    child.stdin.on("error", () => {});
+    void processExit(child).then(() => {
+      if (encoder !== child) return;
+      encoder = null;
+      if (!stopping) setTimeout(startEncoder, 2000);
+    });
+  }
+
+  // One writer sends an audio frame or zeros on every tick. Decoders never write
+  // to the destination, so buffered output from a retired source cannot leak.
+  const bytesPerSampleFrame = channels * 2;
+  const framesPerSecond = 1000 / frameMs;
+  const pump = setInterval(() => {
+    const samples = Math.floor((frameIndex + 1) * sampleRate / framesPerSecond) -
+      Math.floor(frameIndex * sampleRate / framesPerSecond);
+    frameIndex = (frameIndex + 1) % framesPerSecond;
+    const bytes = samples * bytesPerSampleFrame;
+    const audio = playback.read(bytes, bytesPerSampleFrame, sampleRate);
+    if (!encoder?.stdin.writable || encoder.stdin.writableNeedDrain) return;
+    encoder.stdin.write(renderFrame(audio, bytes));
+  }, frameMs);
+
+  async function poll() {
+    while (!stopping) {
+      try {
+        const response = await fetch(`${site}/api/now`, { headers: siteHeaders, cache: "no-store", signal: AbortSignal.timeout(1500) });
+        if (!response.ok) throw new Error(`SignalFlow returned HTTP ${response.status}`);
+        const status = await response.json();
+        if (!status || !("current" in status) || !("next" in status)) throw new Error("Invalid SignalFlow status");
+        if (!stopping) playback.accept(status);
+      } catch (error) {
+        playback.unavailable();
+        log(error.message);
+      }
+      await new Promise(resolve => setTimeout(resolve, pollMs));
+    }
+  }
+
+  async function shutdown() {
+    if (stopping) return;
+    stopping = true;
+    clearInterval(pump);
+    encoder?.stdin.end();
+    const timeout = setTimeout(() => { encoder?.kill("SIGTERM"); process.exit(0); }, 2000);
+    timeout.unref();
+    await playback.shutdown();
+  }
+  process.on("SIGTERM", shutdown);
+  process.on("SIGINT", shutdown);
+  startEncoder();
+  void poll();
+}
+
+if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) runEncoder();
