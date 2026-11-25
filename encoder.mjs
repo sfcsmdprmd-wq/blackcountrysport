@@ -1,15 +1,17 @@
-import { spawn } from "node:child_process";
+import { execFile, spawn } from "node:child_process";
 import { createHash } from "node:crypto";
 import { writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
+import { promisify } from "node:util";
 import { pathToFileURL } from "node:url";
 
 const pollMs = 250;
 const planLeaseMs = 2500;
 const frameMs = 10;
 const retryMaxMs = 30000;
+const prefixSeconds = 2;
 
 function timedItem(item, url) {
   if (!item || !url) return null;
@@ -37,27 +39,42 @@ export function dueSource(plan, now, allowNext = true) {
   return null;
 }
 
-export function createMediaCache(site, headers, fetchMedia = fetch, saveFile = writeFile, root = tmpdir()) {
+export function createMediaCache(site, headers, fetchMedia = fetch, saveFile = writeFile, root = tmpdir(), prepare = null) {
   const entries = new Map();
+  const warmEntries = new Map();
   const resolve = url => new URL(url, site).href;
 
   function download(slot) {
     const key = resolve(slot.url);
     const cached = entries.get(key);
-    if (cached) return cached.task;
+    if (cached && (!prepare || !cached.complete || cached.prefix !== undefined)) return cached.task;
     const controller = new AbortController();
     const entry = { controller, complete: false };
     const signal = AbortSignal.any([controller.signal, AbortSignal.timeout(30000)]);
     entry.task = (async () => {
-      const response = await fetchMedia(key, { headers, signal });
-      if (!response.ok) throw new Error(`Audio download returned HTTP ${response.status}`);
-      const bytes = Buffer.from(await response.arrayBuffer());
-      if (!bytes.length) throw new Error("Downloaded audio file was empty");
+      let path = cached?.path;
+      if (!path) {
+        const response = await fetchMedia(key, { headers, signal });
+        if (!response.ok) throw new Error(`Audio download returned HTTP ${response.status}`);
+        const bytes = Buffer.from(await response.arrayBuffer());
+        if (!bytes.length) throw new Error("Downloaded audio file was empty");
+        signal.throwIfAborted();
+        const hash = createHash("sha256").update(key).digest("hex");
+        path = join(root, `signalflow-${hash}.audio`);
+        await saveFile(path, bytes);
+      }
+      entry.path = path;
       signal.throwIfAborted();
-      const hash = createHash("sha256").update(key).digest("hex");
-      const path = join(root, `signalflow-${hash}.audio`);
-      await saveFile(path, bytes);
+      if (prepare) entry.prefix = await prepare(path, signal);
       signal.throwIfAborted();
+      if (entry.prefix?.length) {
+        warmEntries.set(key, entry);
+        if (warmEntries.size > 24) {
+          const [oldKey, oldEntry] = warmEntries.entries().next().value;
+          oldEntry.prefix = undefined;
+          warmEntries.delete(oldKey);
+        }
+      }
       entry.complete = true;
       return path;
     })().catch(error => {
@@ -78,11 +95,11 @@ export function createMediaCache(site, headers, fetchMedia = fetch, saveFile = w
     }
   }
 
-  return { download, retain };
+  return { download, retain, prefix: slot => entries.get(resolve(slot.url))?.prefix };
 }
 
 export function createPlayback({
-  now = Date.now, open, stop, cache, onError = () => {},
+  now = Date.now, open, stop, cache, onError = () => {}, onFirstAudio = () => {},
   setTimer = setTimeout, clearTimer = clearTimeout,
 }) {
   let plan = { current: null, next: null, scheduledNext: null };
@@ -131,7 +148,7 @@ export function createPlayback({
       const prepared = slot.item.kind === "upload" ? await cache.download(slot) : null;
       const time = now(), target = desired(time);
       if (job !== attempt || target?.key !== slot.key) return;
-      attempt.source = open(target, prepared, time, error => failed(attempt, error));
+      attempt.source = open(target, prepared, time, error => failed(attempt, error), cache.prefix?.(target));
       attempt.lastAudioAt = now();
     } catch (error) { failed(attempt, error); }
   }
@@ -176,7 +193,7 @@ export function createPlayback({
     reconcile();
   }
 
-  function read(frameBytes, bytesPerSampleFrame, sampleRate) {
+  function read(frameBytes, bytesPerSampleFrame, sampleRate, frameTime = now()) {
     const time = now();
     const target = desired(time);
     if (job && job.slot.key !== target?.key) {
@@ -184,18 +201,25 @@ export function createPlayback({
       return null;
     }
     const source = job?.source;
-    if (!source) return null;
-    const limit = Math.floor((Math.min(target.end, expires) - time) * sampleRate / 1000) * bytesPerSampleFrame;
+    if (!source || frameTime < target.start) return null;
+    const limit = Math.floor((Math.min(target.end, expires) - frameTime) * sampleRate / 1000) * bytesPerSampleFrame;
     frameBytes = Math.min(frameBytes, limit);
     if (frameBytes <= 0) return null;
+    const prefix = source.prefix?.subarray(source.prefixOffset, source.prefixOffset + frameBytes);
+    if (prefix) source.prefixOffset += prefix.length;
+    const remaining = frameBytes - (prefix?.length ?? 0);
     const available = source.stdout.readableLength;
-    const chunk = source.stdout.read(available >= frameBytes ? frameBytes : source.exited && available ? available : frameBytes);
+    const decoded = remaining && source.stdout.read(source.exited && available && available < remaining ? available : remaining);
+    const chunk = prefix?.length
+      ? decoded ? Buffer.concat([prefix, decoded]) : Buffer.from(prefix)
+      : decoded;
     if (chunk?.length) {
       job.lastAudioAt = time;
+      if (!job.hasAudio) onFirstAudio(target, time);
       job.hasAudio = true;
       retryKey = undefined;
       failures = 0;
-      return chunk;
+      return fadeScheduledStream(chunk, target, frameTime, bytesPerSampleFrame, sampleRate);
     }
     if (source.exited || time - job.lastAudioAt > source.timeoutMs) {
       failed(job, new Error(`Source ended or stalled: ${job.slot.item.title}`));
@@ -210,7 +234,59 @@ export function createPlayback({
     retire();
     return closing;
   }
-  return { accept, unavailable, read, shutdown };
+  function resync(requireFresh = false) {
+    if (requireFresh) healthy = false;
+    retire();
+    reconcile();
+  }
+  return { accept, unavailable, read, shutdown, resync };
+}
+
+export function fadeScheduledStream(audio, slot, frameTime, bytesPerSampleFrame, sampleRate) {
+  if (slot.item.kind !== "stream" || slot.item.isDefault) return audio;
+  const fadeMs = Math.min(3000, slot.end - slot.start);
+  if (frameTime + audio.length / bytesPerSampleFrame * 1000 / sampleRate <= slot.end - fadeMs) return audio;
+  for (let offset = 0; offset + 1 < audio.length; offset += 2) {
+    const time = frameTime + Math.floor(offset / bytesPerSampleFrame) * 1000 / sampleRate;
+    const gain = Math.max(0, Math.min(1, (slot.end - time) / fadeMs));
+    audio.writeInt16LE(Math.trunc(audio.readInt16LE(offset) * gain), offset);
+  }
+  return audio;
+}
+
+export function createPcmClock({ sampleRate, bytesPerSampleFrame, read, onResync,
+  monotonicNow = () => performance.now(), wallNow = Date.now, maxLagMs = 250 }) {
+  let origin = monotonicNow(), tick = 0, blocked = false;
+  function reset() {
+    origin = monotonicNow();
+    tick = 0;
+    blocked = false;
+  }
+  function pump(writable) {
+    const elapsed = monotonicNow() - origin;
+    const due = Math.floor(elapsed / frameMs);
+    if (elapsed - tick * frameMs > maxLagMs) {
+      const stalled = blocked || !writable || writable.writableNeedDrain;
+      onResync(due - tick, stalled);
+      reset();
+      return;
+    }
+    if (!writable?.writable || writable.writableNeedDrain) {
+      blocked = true;
+      return;
+    }
+    blocked = false;
+    const wall = wallNow();
+    while (tick < due && !writable.writableNeedDrain) {
+      const samples = Math.floor((tick + 1) * sampleRate * frameMs / 1000) -
+        Math.floor(tick * sampleRate * frameMs / 1000);
+      const bytes = samples * bytesPerSampleFrame;
+      const frameTime = wall - (elapsed - (++tick * frameMs));
+      writable.write(renderFrame(read(bytes, bytesPerSampleFrame, sampleRate, frameTime), bytes));
+    }
+    blocked = writable.writableNeedDrain;
+  }
+  return { pump, reset };
 }
 
 export function renderFrame(audio, bytes) {
@@ -250,20 +326,40 @@ function runEncoder(env = process.env) {
     ? { "OAI-Sites-Authorization": `Bearer ${env.SIGNALFLOW_SITE_TOKEN}` } : {};
   const ffmpegHeader = env.SIGNALFLOW_SITE_TOKEN
     ? `OAI-Sites-Authorization: Bearer ${env.SIGNALFLOW_SITE_TOKEN}\r\n` : "";
-  const cache = createMediaCache(site, siteHeaders);
+  const bytesPerSampleFrame = channels * 2;
+  const execute = promisify(execFile);
+  async function prepare(path, signal) {
+    try {
+      const { stdout } = await execute("ffmpeg", [
+        "-hide_banner", "-loglevel", "error", "-i", path, "-t", String(prefixSeconds),
+        "-vn", "-ar", String(sampleRate), "-ac", String(channels), "-f", "s16le", "pipe:1",
+      ], { encoding: "buffer", maxBuffer: sampleRate * bytesPerSampleFrame * (prefixSeconds + 1),
+        signal: AbortSignal.any([signal, AbortSignal.timeout(3000)]) });
+      return stdout;
+    } catch {
+      signal.throwIfAborted();
+      return null;
+    }
+  }
+  const cache = createMediaCache(site, siteHeaders, fetch, writeFile, tmpdir(), prepare);
   const log = (...args) => console.log(new Date().toISOString(), ...args);
 
-  function open(slot, cached, now, onError) {
+  function open(slot, cached, now, onError, prefix) {
     const { item } = slot;
     const args = ["-hide_banner", "-loglevel", "warning", "-thread_queue_size", "2048"];
     let input = cached;
-    let override;
+    let override, prefixOffset = 0;
     if (item.kind === "upload") {
       args.push("-analyzeduration", "20000000", "-probesize", "20000000");
       if (item.loop) args.push("-stream_loop", "-1");
       const elapsed = (now - slot.start) / 1000;
       const seek = item.loop && item.durationSeconds ? elapsed % item.durationSeconds : elapsed;
-      if (seek > 0) args.push("-ss", seek.toFixed(3));
+      const seekSamples = Math.floor(seek * sampleRate);
+      prefixOffset = seekSamples * bytesPerSampleFrame;
+      const tail = prefix && prefixOffset < prefix.length && (!item.loop || item.durationSeconds > prefixSeconds)
+        ? prefix.length / bytesPerSampleFrame / sampleRate : seek;
+      if (tail === seek) prefix = null;
+      if (tail > 0) args.push("-ss", tail.toFixed(6));
     } else {
       const remote = item.sourceUrl && new URL(item.sourceUrl);
       const host = env.STREAM_HOST_OVERRIDE_HOST?.trim();
@@ -280,15 +376,11 @@ function runEncoder(env = process.env) {
     args.push("-i", input);
     const layout = channels === 1 ? "mono" : "stereo";
     const filters = [`aresample=${sampleRate}:async=1:first_pts=0`, `aformat=sample_fmts=s16:sample_rates=${sampleRate}:channel_layouts=${layout}`];
-    const remaining = (slot.end - now) / 1000;
-    if (item.kind === "stream" && !item.isDefault) {
-      filters.push(`afade=t=out:st=${Math.max(0, remaining - 3).toFixed(3)}:d=${Math.min(3, remaining).toFixed(3)}`);
-    }
     args.push("-vn", "-af", filters.join(","), "-f", "s16le", "-acodec", "pcm_s16le",
       "-ar", String(sampleRate), "-ac", String(channels), "pipe:1");
     const child = spawn("ffmpeg", args, { stdio: [override ? "pipe" : "ignore", "pipe", "pipe"] });
     const exited = processExit(child);
-    const source = { child, stdout: child.stdout, childExit: exited, exited: false, timeoutMs: 12000 };
+    const source = { child, stdout: child.stdout, childExit: exited, exited: false, timeoutMs: 12000, prefix, prefixOffset };
     child.stderr.on("data", data => process.stderr.write(data));
     child.once("error", onError);
     child.stdout.on("error", onError);
@@ -315,14 +407,16 @@ function runEncoder(env = process.env) {
     await Promise.all([stopChild(source.fetcher, source.fetcherExit), stopChild(source.child, source.childExit)]);
   }
 
-  const playback = createPlayback({ open, stop, cache, onError: error => log(error.message) });
+  const playback = createPlayback({ open, stop, cache, onError: error => log(error.message),
+    onFirstAudio: (slot, time) => log(`First PCM for ${slot.item.title}: ${Math.max(0, time - slot.start)}ms after start`),
+  });
   const icecastUrl = () => {
     const auth = `${encodeURIComponent(env.ICECAST_SOURCE_USER)}:${encodeURIComponent(env.ICECAST_SOURCE_PASSWORD)}`;
     const mount = env.ICECAST_MOUNT.startsWith("/") ? env.ICECAST_MOUNT : `/${env.ICECAST_MOUNT}`;
     return `icecast://${auth}@${env.ICECAST_HOST}:${env.ICECAST_PORT}${mount}`;
   };
 
-  let encoder, stopping = false, frameIndex = 0;
+  let encoder, stopping = false;
   function startEncoder() {
     if (encoder || stopping) return;
     const codec = format === "aac" ? ["-c:a", "aac", "-f", "adts", "-content_type", "audio/aac"]
@@ -336,6 +430,8 @@ function runEncoder(env = process.env) {
     log("Connecting continuous output to Icecast");
     const child = spawn("ffmpeg", args, { stdio: ["pipe", "ignore", "pipe"] });
     encoder = child;
+    clock.reset();
+    playback.resync(true);
     child.stderr.on("data", data => process.stderr.write(data));
     child.stdin.on("error", () => {});
     void processExit(child).then(() => {
@@ -347,16 +443,16 @@ function runEncoder(env = process.env) {
 
   // One writer sends an audio frame or zeros on every tick. Decoders never write
   // to the destination, so buffered output from a retired source cannot leak.
-  const bytesPerSampleFrame = channels * 2;
-  const framesPerSecond = 1000 / frameMs;
+  const clock = createPcmClock({
+    sampleRate, bytesPerSampleFrame, read: playback.read,
+    onResync(missedTicks, stalled) {
+      log(`Output clock resync after ${missedTicks * frameMs}ms of backlog`);
+      if (stalled && encoder) encoder.kill("SIGKILL");
+      playback.resync();
+    },
+  });
   const pump = setInterval(() => {
-    const samples = Math.floor((frameIndex + 1) * sampleRate / framesPerSecond) -
-      Math.floor(frameIndex * sampleRate / framesPerSecond);
-    frameIndex = (frameIndex + 1) % framesPerSecond;
-    const bytes = samples * bytesPerSampleFrame;
-    const audio = playback.read(bytes, bytesPerSampleFrame, sampleRate);
-    if (!encoder?.stdin.writable || encoder.stdin.writableNeedDrain) return;
-    encoder.stdin.write(renderFrame(audio, bytes));
+    if (encoder) clock.pump(encoder.stdin);
   }, frameMs);
 
   async function poll() {
