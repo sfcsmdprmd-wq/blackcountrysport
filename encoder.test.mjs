@@ -261,3 +261,32 @@ test("output resync chooses the current API slot and does not retry an expired s
     ["open","second",800],["stop","second",1500],
   ]);
 });
+
+test("Sustain drains the PCM tail after child exit and never restarts the completed occurrence", async () => {
+  let time = 0, opens = 0;
+  const pcm = new Readable({ read() {} });
+  const player = createPlayback({
+    now: () => time, setTimer: () => 0, clearTimer: () => {},
+    cache: { download: async () => "/cached", retain() {} },
+    open() { opens++; return { stdout: pcm, exited: true, exitCode: 0, timeoutMs: 12000 }; },
+    stop() {},
+  });
+  const item = track("sustain:short", 0, 4000);
+  player.accept(status(item, null, 0));
+  await flush();
+  // The child has exited, but stdout has not delivered the last packet yet.
+  assert.equal(player.read(20, 2, 1000), null);
+  pcm.push(Buffer.alloc(26, 1));
+  pcm.push(null);
+  assert.equal(player.read(20, 2, 1000).length, 20);
+  assert.equal(player.read(20, 2, 1000).length, 6);
+  player.read(20, 2, 1000);
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(player.read(20, 2, 1000), null);
+  player.unavailable();
+  player.resync(true);
+  time = 3000;
+  player.accept(status(item, null, time));
+  await flush();
+  assert.equal(opens, 1);
+});
