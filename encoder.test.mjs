@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import { Readable } from "node:stream";
-import { createMediaCache, createPlayback, dueSource, playbackPlan, renderFrame } from "./encoder.mjs";
+import { createMediaCache, createPlayback, createPcmClock, dueSource, fadeScheduledStream, playbackPlan, renderFrame } from "./encoder.mjs";
 
 const iso = ms => new Date(ms).toISOString();
 const track = (id, start, end, kind = "upload", assetId = id) => ({
@@ -159,4 +159,105 @@ test("PCM cannot cross an absolute stop within an output frame", async () => {
   assert.deepEqual(renderFrame(audio,20).subarray(10),Buffer.alloc(10));
   await f.advance(1000);
   assert.equal(f.player.read(20,2,1000),null);
+});
+
+test("monotonic clock writes the exact sample count over an hour with jitter and short backpressure", () => {
+  let time = 0, total = 0, reads = 0;
+  const sink = { writable:true, writableNeedDrain:false, write(chunk) { total += chunk.length; } };
+  const clock = createPcmClock({
+    sampleRate:22050, bytesPerSampleFrame:4,
+    monotonicNow:()=>time, wallNow:()=>time,
+    read() { reads++; return null; },
+    onResync() { assert.fail("short stalls must catch up without resync"); },
+  });
+  for (time = 23; time < 3600000; time += 23) {
+    sink.writableNeedDrain = time % 997 < 85;
+    const previous = reads;
+    clock.pump(sink);
+    if (sink.writableNeedDrain) assert.equal(reads, previous);
+  }
+  time=3600000;
+  sink.writableNeedDrain=false;
+  clock.pump(sink);
+  assert.equal(total,22050*4*3600);
+});
+
+test("prolonged backpressure signals a resync without draining stale PCM", () => {
+  let time=0, reads=0;
+  const events=[];
+  const blocked={writable:true,writableNeedDrain:true,write(){assert.fail("blocked");}};
+  const clock=createPcmClock({sampleRate:44100,bytesPerSampleFrame:4,monotonicNow:()=>time,
+    read(){reads++;},onResync:(...args)=>events.push(args)});
+  time=100;
+  clock.pump(blocked);
+  time=300;
+  clock.pump(blocked);
+  assert.deepEqual(events,[[30,true]]);
+  assert.equal(reads,0);
+});
+
+test("scheduled stream fades against wall time and Sustain upload remains unchanged", () => {
+  const sample = Buffer.alloc(4);
+  sample.writeInt16LE(12000,0);
+  sample.writeInt16LE(12000,2);
+  const stream = playbackPlan(status(track("stream",0,5000,"stream"),null,0)).current;
+  assert.equal(fadeScheduledStream(Buffer.from(sample),stream,3500,2,1000).readInt16LE(0),6000);
+  const sustain = playbackPlan(status(track("sustain:a",0,5000),null,0)).current;
+  assert.deepEqual(fadeScheduledStream(Buffer.from(sample),sustain,4998,2,1000),sample);
+});
+
+test("a failed decoder is retired and a following slot bypasses its retry backoff", async () => {
+  const events=[];
+  let time=0;
+  const player=createPlayback({now:()=>time,setTimer:()=>0,clearTimer:()=>{},
+    cache:{download:async()=>"/cached",retain(){}},
+    open(slot) {
+      events.push("open:"+slot.item.id);
+      return {id:slot.item.id,exited:true,timeoutMs:12000,stdout:Readable.from([],{objectMode:false})};
+    },
+    stop(source) {events.push("stop:"+source.id);},
+  });
+  const broken=track("broken",0,250,"stream"), next=track("next",250,1500);
+  player.accept(status(broken,next,0));
+  assert.equal(player.read(20,2,1000),null);
+  time=250;
+  player.accept(status(next,null,250));
+  await flush();
+  assert.deepEqual(events,["open:broken","stop:broken","open:next"]);
+});
+
+test("prepared PCM remains gated until its slot is due and the old decoder exits", async () => {
+  const f = fixture({delayStop:true});
+  const current=track("outgoing",0,1000,"stream");
+  const next=track("sustain:warmed",1000,2000);
+  f.player.accept(status(current,next,0));
+  await f.advance(999);
+  assert.deepEqual(f.events,[["open","outgoing",0]]);
+  await f.advance(1000);
+  assert.equal(f.player.read(20,2,1000,999),null);
+  f.completeStop();
+  await flush();
+  assert.equal(f.player.read(20,2,1000,999),null);
+  assert.deepEqual(f.events.at(-1),["open","sustain:warmed",1000]);
+});
+
+test("output resync chooses the current API slot and does not retry an expired source", async () => {
+  const f=fixture();
+  const first=track("first",0,500,"stream"), second=track("second",500,1500,"stream");
+  f.player.accept(status(first,second,0));
+  await f.advance(800);
+  f.player.accept(status(second,null,800));
+  f.player.resync(true);
+  await flush();
+  assert.deepEqual(f.events.at(-1),["stop","second",800]);
+  f.player.accept(status(second,null,801));
+  await flush();
+  await f.advance(1600);
+  f.player.resync();
+  await flush();
+  assert.deepEqual(f.events,[
+    ["open","first",0],["stop","first",500],
+    ["open","second",500],["stop","second",800],
+    ["open","second",800],["stop","second",1500],
+  ]);
 });
